@@ -1,0 +1,17 @@
+訓練
+
+先設定環境變數避免記憶體碎片，然後再跑訓練：
+set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+
+訓練
+python v1.py --data processed_data/features.npz --max_stocks 500 --batch_size 4 --gru_hidden 192 --num_layers 4 --pos_weight 5.0 --epochs 20 --lr 5e-5 --device cuda --embed_dim 32 --train_window 2000 --step_size 250
+
+使用
+python infer.py --model checkpoints/fold_3/best_model.pth --gru_hidden 192 --top_k 50 --device cuda
+
+
+
+驗證(csv檔案名稱要改成確的)
+python verify.py --file recommendations_2026-06-09.csv

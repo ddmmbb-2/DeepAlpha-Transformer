@@ -17,7 +17,7 @@ MACRO_TICKERS = ['^NDX', '^GSPC', '^VIX', '^SOX', 'NVDA', 'AAPL', 'AMD']
 
 # 3. 下載日期範圍
 START_DATE = '2015-01-01'
-END_DATE   = '2023-12-31'
+END_DATE   = '2026-6-10'
 
 # 4. 每批股票數量與休息時間
 BATCH_SIZE = 10
