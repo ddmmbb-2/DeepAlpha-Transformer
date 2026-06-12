@@ -117,25 +117,26 @@ def main():
     X = np.zeros((T, N, F), dtype=np.float32)
     
     for i, fname in enumerate(tqdm(feat_names, desc="標準化進度")):
-        # 1. 抓取特徵，先將任何除以 0 產生的無限大 (Inf) 變成 NaN，最後全部補 0
         df_f = features_dict[fname].replace([np.inf, -np.inf], np.nan).fillna(0)
         
-        # 2. 計算 expanding 序列並向後平移一天
+        # 計算 expanding 序列並向後平移一天
         exp_mean = df_f.expanding().mean().shift(1)
         exp_std = df_f.expanding().std().shift(1)
         
-        # 3. 暴力填補 shift 與 std 造成的前期 NaN (使用 bfill 往回填，若還是空就補預設值)
+        # 暴力填補 shift 與 std 造成的前期 NaN
         rolling_mean = exp_mean.bfill().fillna(0).values
         rolling_std = exp_std.bfill().fillna(1e-8).values
         
-        # 4. 避免極端情況下標準差為 0
         rolling_std[rolling_std == 0] = 1e-8
         
-        # 5. 計算 Z-score
+        # 計算 Z-score
         z_score = (df_f.values - rolling_mean) / rolling_std
         
-        # 6. 【最後一道防線】強勢把矩陣中任何殘存的 NaN 或 Inf 歸零！
+        # 強勢歸零殘存的 NaN 或 Inf
         z_score = np.nan_to_num(z_score, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # 🛡️ 【終極防護：AMP 溢位殺手】將 Z-score 限制在正負 10 之間！
+        z_score = np.clip(z_score, -10.0, 10.0)
         
         X[:, :, i] = z_score
 

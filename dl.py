@@ -22,7 +22,7 @@ END_DATE   = '2026-6-10'
 # 4. 每批股票數量與休息時間
 BATCH_SIZE = 10
 MIN_SLEEP = 30   # 0.5 分鐘
-MAX_SLEEP = 120   # 2 分鐘
+MAX_SLEEP = 60   # 1 分鐘
 
 # 5. 最大重試次數（下載失敗時）
 MAX_RETRIES = 3

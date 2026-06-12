@@ -73,7 +73,7 @@ class ScaledGRUTransformer(nn.Module):
 
 # ================== 載入資料 ==================
 print("載入最新打包特徵資料...")
-data = np.load(args.data)
+data = np.load(args.data, allow_pickle=True)  # 🆕 加上 allow_pickle=True
 features = data['features']   # (T, N, F)
 mask = data['mask']           # (T, N)
 stocks = data['stocks']
