@@ -1,186 +1,160 @@
-import pandas as pd
 import numpy as np
-import glob
+import pandas as pd
 import os
 from tqdm import tqdm
 
-# -------------------- 設定 --------------------
-batch_dir = 'stock_data_batches'
-output_dir = 'processed_data'
-os.makedirs(output_dir, exist_ok=True)
+def main():
+    print("🚀 啟動 V5.1 終極特徵與標籤工程 (無未來函數/無生存者偏差版)")
+    
+    raw_path = 'processed_data/all_stocks_raw.pkl'
+    out_path = 'processed_data/features.npz'
+    
+    if not os.path.exists(raw_path):
+        print(f"❌ 找不到原始資料: {raw_path}")
+        return
 
-TOP_LIQUID = 500  # 只保留成交量最大的前 N 檔
+    print("📦 載入原始股價資料...")
+    full_df = pd.read_pickle(raw_path)
+    close_raw = full_df.xs('Close', axis=1, level=0)
+    vol_raw = full_df.xs('Volume', axis=1, level=0)
 
-# -------------------- 1. 合併所有批次 --------------------
-print("讀取與合併所有批次...")
-all_files = sorted(glob.glob(os.path.join(batch_dir, 'batch_*.csv')))
-print(f"找到 {len(all_files)} 個批次檔案")
+    # ==========================================
+    # 🛡️ 1. 動態流動性遮罩 (絕對不偷看未來)
+    # ==========================================
+    print("🛡️ 計算動態流動性遮罩...")
+    TOP_LIQUID = 500
+    
+    # 計算過去 20 天的滾動平均成交量
+    rolling_vol = vol_raw.rolling(window=20, min_periods=1).mean()
+    # 每天橫向排名，成交量越大名次越前
+    vol_rank = rolling_vol.rank(axis=1, ascending=False)
+    liquid_mask_df = vol_rank <= TOP_LIQUID
+    
+    # 必須要有收盤價
+    price_mask_df = close_raw.notna() & (close_raw > 0)
+    final_mask_df = price_mask_df & liquid_mask_df
 
-dfs = []
-for f in all_files:
-    df = pd.read_csv(f, header=[0, 1], index_col=0, parse_dates=True)
-    dfs.append(df)
+    # ==========================================
+    # 🏷️ 2. 終極標籤計算 (防禦生存者偏差)
+    # ==========================================
+    print("🏷️ 計算防禦型訓練標籤 (缺失值懲罰 -30%)...")
+    labels_df = pd.DataFrame(0, index=close_raw.index, columns=close_raw.columns)
+    
+    # 未來 20 天的真實報酬
+    fwd_cum_ret = close_raw.shift(-20) / close_raw - 1
+    PENALTY_RETURN = -0.30  # 針對下市/長期停牌股的嚴厲懲罰
 
-full_df = pd.concat(dfs, axis=1)
-full_df.sort_index(axis=1, inplace=True)
-full_df = full_df.loc[:, ~full_df.columns.duplicated()]
-print(f"去重後形狀: {full_df.shape}")
+    for date in tqdm(fwd_cum_ret.index, desc="計算標籤"):
+        current_eligible_stocks = final_mask_df.loc[date]
+        if current_eligible_stocks.sum() == 0:
+            continue
+            
+        row_ret = fwd_cum_ret.loc[date].copy()
+        
+        # 找出當天合格，但未來 20 天資料消失的「地雷股」，給予 -30% 懲罰
+        missing_future = current_eligible_stocks & row_ret.isna()
+        row_ret[missing_future] = PENALTY_RETURN
+        
+        # 計算包含地雷股在內的「真實截面市場平均」
+        true_mkt_mean = row_ret[current_eligible_stocks].mean()
+        
+        # 計算超額報酬
+        excess_ret = row_ret - true_mkt_mean
+        valid_excess = excess_ret[current_eligible_stocks]
+        
+        if len(valid_excess) > 0:
+            # 嚴格篩選前 20% 強勢股
+            threshold = valid_excess.quantile(0.8)
+            labels_df.loc[date, current_eligible_stocks] = (valid_excess >= threshold).astype(int)
 
-# -------------------- 流動性篩選 --------------------
-print(f"根據平均成交量篩選前 {TOP_LIQUID} 檔...")
-vol_raw = full_df.xs('Volume', axis=1, level=0)
-avg_vol = vol_raw.mean()  # 每檔股票的時間平均成交量
-top_stocks = avg_vol.nlargest(TOP_LIQUID).index.tolist()
+    # ==========================================
+    # 📊 3. 15 項黃金特徵計算 (Expanding Z-score)
+    # ==========================================
+    print("📊 提取 OHLCV 資料並計算 15 項量價特徵...")
+    
+    # 提取所需欄位
+    open_raw = full_df.xs('Open', axis=1, level=0)
+    high_raw = full_df.xs('High', axis=1, level=0)
+    low_raw = full_df.xs('Low', axis=1, level=0)
+    
+    features_dict = {}
+    
+    # 1-3. 價格動量 (Momentum)
+    daily_ret = close_raw / close_raw.shift(1) - 1
+    features_dict['mom5'] = close_raw / close_raw.shift(5) - 1
+    features_dict['mom20'] = close_raw / close_raw.shift(20) - 1
+    features_dict['mom60'] = close_raw / close_raw.shift(60) - 1
+    
+    # 4-6. 均線乖離率 (Bias)
+    features_dict['sma5_bias'] = close_raw / close_raw.rolling(5).mean() - 1
+    features_dict['sma20_bias'] = close_raw / close_raw.rolling(20).mean() - 1
+    features_dict['sma60_bias'] = close_raw / close_raw.rolling(60).mean() - 1
+    
+    # 7-9. 成交量比率 (Volume Ratio)
+    features_dict['vol_ratio_5'] = vol_raw / vol_raw.rolling(5).mean()
+    features_dict['vol_ratio_20'] = vol_raw / vol_raw.rolling(20).mean()
+    features_dict['vol_ratio_60'] = vol_raw / vol_raw.rolling(60).mean()
+    
+    # 10-11. 波動度 (Volatility)
+    features_dict['volatility_20'] = daily_ret.rolling(20).std()
+    features_dict['volatility_60'] = daily_ret.rolling(60).std()
+    
+    # 12-14. K線型態與日內特徵
+    features_dict['amplitude'] = (high_raw - low_raw) / close_raw.shift(1) # 振幅
+    features_dict['gap'] = (open_raw - close_raw.shift(1)) / close_raw.shift(1) # 跳空
+    features_dict['close_open_ratio'] = (close_raw - open_raw) / open_raw # 日內實體K線漲跌
+    
+    # 15. 價格區間位置 (Price Position)
+    rolling_min_20 = low_raw.rolling(20).min()
+    rolling_max_20 = high_raw.rolling(20).max()
+    features_dict['price_pos_20'] = (close_raw - rolling_min_20) / (rolling_max_20 - rolling_min_20 + 1e-8)
 
-# 只保留這些股票的欄位
-full_df = full_df.loc[:, full_df.columns.get_level_values(1).isin(top_stocks)]
-print(f"篩選後股票數: {full_df.shape[1] // len(full_df.columns.levels[0])}")
+    # 整合特徵 (T, N, F) 並進行 Expanding Z-score 標準化
+    print("🔄 進行極致嚴格的無未來函數 Z-score 標準化 (啟動 NaN 防護罩)...")
+    feat_names = list(features_dict.keys())
+    T, N = close_raw.shape
+    F = len(feat_names)
+    X = np.zeros((T, N, F), dtype=np.float32)
+    
+    for i, fname in enumerate(tqdm(feat_names, desc="標準化進度")):
+        # 1. 抓取特徵，先將任何除以 0 產生的無限大 (Inf) 變成 NaN，最後全部補 0
+        df_f = features_dict[fname].replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        # 2. 計算 expanding 序列並向後平移一天
+        exp_mean = df_f.expanding().mean().shift(1)
+        exp_std = df_f.expanding().std().shift(1)
+        
+        # 3. 暴力填補 shift 與 std 造成的前期 NaN (使用 bfill 往回填，若還是空就補預設值)
+        rolling_mean = exp_mean.bfill().fillna(0).values
+        rolling_std = exp_std.bfill().fillna(1e-8).values
+        
+        # 4. 避免極端情況下標準差為 0
+        rolling_std[rolling_std == 0] = 1e-8
+        
+        # 5. 計算 Z-score
+        z_score = (df_f.values - rolling_mean) / rolling_std
+        
+        # 6. 【最後一道防線】強勢把矩陣中任何殘存的 NaN 或 Inf 歸零！
+        z_score = np.nan_to_num(z_score, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        X[:, :, i] = z_score
 
-full_df.to_pickle(os.path.join(output_dir, 'all_stocks_raw.pkl'))
-print("all_stocks_raw.pkl 已儲存（篩選後）")
+    # ==========================================
+    # 💾 4. 儲存打包
+    # ==========================================
+    mask_arr = final_mask_df.values.astype(int)
+    y_arr = labels_df.values.astype(int)
+    
+    print(f"📦 打包資料: 特徵形狀 {X.shape}, 遮罩形狀 {mask_arr.shape}")
+    np.savez_compressed(
+        out_path,
+        features=X,
+        labels=y_arr,
+        mask=mask_arr,
+        stocks=close_raw.columns.values,
+        dates=close_raw.index.astype(str).values
+    )
+    print("✅ 特徵資料與標籤重構完成！")
 
-# -------------------- 2. 特徵工程 --------------------
-print("\n開始特徵工程 (V4 終極完全體版)...")
-
-close = full_df.xs('Close',  axis=1, level=0)
-high  = full_df.xs('High',   axis=1, level=0)
-low   = full_df.xs('Low',    axis=1, level=0)
-open_ = full_df.xs('Open',   axis=1, level=0)
-vol   = full_df.xs('Volume', axis=1, level=0)
-
-stocks = close.columns.tolist()
-high   = high[stocks]
-low    = low[stocks]
-open_  = open_[stocks]
-vol    = vol[stocks]
-
-n_stocks = len(stocks)
-print(f"股票總數: {n_stocks}, 交易日數: {len(close)}")
-
-# 安全除法
-def safe_div(a, b):
-    return np.where(b != 0, a / b, 0.0)
-
-print("計算 15 項黃金量價與結構因子...")
-# ------ 核心 15 項特徵 ------
-ret = close.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-amp = pd.DataFrame(safe_div((high - low).values, close.shift(1).values), index=high.index, columns=high.columns).fillna(0)
-gap = pd.DataFrame(safe_div((open_ - close.shift(1)).values, close.shift(1).values), index=open_.index, columns=open_.columns).fillna(0)
-vol_chg = vol.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-rolling_mean_vol = vol.rolling(20, min_periods=5).mean()
-rel_vol = pd.DataFrame(safe_div(vol.values, rolling_mean_vol.values) - 1, index=vol.index, columns=vol.columns).fillna(0)
-
-ma5 = close.rolling(5, min_periods=2).mean()
-bias5 = pd.DataFrame(safe_div(close.values, ma5.values) - 1, index=close.index, columns=close.columns).fillna(0)
-
-ma20 = close.rolling(20, min_periods=5).mean()
-bias20 = pd.DataFrame(safe_div(close.values, ma20.values) - 1, index=close.index, columns=close.columns).fillna(0)
-
-volatility5 = ret.rolling(5, min_periods=2).std().fillna(0)
-mom20 = close.pct_change(20, fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0)
-turnover = pd.DataFrame(safe_div(vol.values, rolling_mean_vol.values), index=vol.index, columns=vol.columns).fillna(0)
-
-high_20 = high.rolling(20, min_periods=5).max()
-low_20  = low.rolling(20, min_periods=5).min()
-price_pos = pd.DataFrame(safe_div((close - low_20).values, (high_20 - low_20).values), index=close.index, columns=close.columns).fillna(0.5)
-
-market_ret = ret.mean(axis=1)
-excess_20 = (ret.sub(market_ret, axis=0)).rolling(20, min_periods=5).sum().fillna(0)
-
-# 高級對比特徵
-dollar_vol = close * vol
-
-high_60 = high.rolling(60, min_periods=15).max()
-dist_high60 = pd.DataFrame(safe_div((close - high_60).values, high_60.values), index=close.index, columns=close.columns).fillna(0)
-
-low_60 = low.rolling(60, min_periods=15).min()
-dist_low60 = pd.DataFrame(safe_div((close - low_60).values, low_60.values), index=close.index, columns=close.columns).fillna(0)
-
-# ------ 組合 15 項特徵 ------
-feat_dict = {
-    'ret': ret, 'amp': amp, 'gap': gap, 'vol_chg': vol_chg, 'rel_vol': rel_vol,
-    'bias5': bias5, 'bias20': bias20, 'volatility5': volatility5, 'mom20': mom20,
-    'turnover': turnover, 'price_pos': price_pos, 'excess_20': excess_20,
-    'dollar_vol': dollar_vol, 'dist_high60': dist_high60, 'dist_low60': dist_low60
-}
-df_feat = pd.concat(feat_dict, axis=1, keys=feat_dict.keys())
-df_feat = df_feat.swaplevel(0, 1, axis=1).sort_index(axis=1)   
-F = len(feat_dict)
-print(f"終極總特徵數: {F}")
-
-# ------ 遮罩 ------
-mask = close.notna() & (vol > 0)
-mask = mask.astype(np.uint8)
-
-# -------------------- 標籤：未來20日累積超額報酬前 20% --------------------
-print("計算標籤 (未來20日超額報酬)...")
-HOLD_DAYS = 20  
-fwd_cum_ret = close.shift(-HOLD_DAYS) / close - 1
-fwd_cum_ret = fwd_cum_ret.replace([np.inf, -np.inf], np.nan)
-
-mkt_ret = pd.Series(np.nan, index=fwd_cum_ret.index)
-for date in fwd_cum_ret.index:
-    row = fwd_cum_ret.loc[date]
-    valid = row.notna() & (mask.loc[date] == 1)
-    if valid.sum() >= 10:
-        mkt_ret.loc[date] = row[valid].mean()
-
-excess_ret = fwd_cum_ret.sub(mkt_ret, axis=0)   
-
-labels = pd.DataFrame(-1, index=fwd_cum_ret.index, columns=fwd_cum_ret.columns, dtype=np.int8)
-for date in tqdm(excess_ret.index, desc="標籤計算"):
-    row = excess_ret.loc[date]
-    valid_mask = row.notna() & (mask.loc[date] == 1)
-    if valid_mask.sum() < 10:
-        continue
-    threshold = row[valid_mask].quantile(0.8)
-    strong = row[valid_mask].index[row[valid_mask] >= threshold]
-    weak   = row[valid_mask].index[row[valid_mask] < threshold]
-    labels.loc[date, strong] = 1
-    labels.loc[date, weak]   = 0
-
-# ------ 🚀 核心回滾：時間序列 Expanding Z-score 標準化 (擁抱 GRU 的時序連續性) ------
-print("執行單向擴展窗口 (Expanding Window) 標準化...")
-feat_list = list(feat_dict.keys())
-normed_arrays = []
-
-for feat in tqdm(feat_list, desc="時序標準化"):
-    sub = df_feat.xs(feat, axis=1, level=1)
-    sub = sub.reindex(columns=stocks)
-
-    # 💡 迎回核心引擎：每檔股票計算自己過去的平均與標準差，並 shift(1) 杜絕未來數據
-    exp_mean = sub.expanding(min_periods=5).mean().shift(1)
-    exp_std  = sub.expanding(min_periods=5).std().shift(1)
-    exp_std  = exp_std.replace(0, 1e-8)
-
-    normed = (sub - exp_mean) / exp_std
-    normed = normed.replace([np.inf, -np.inf], np.nan)
-    normed = normed.fillna(0)
-    normed = np.clip(normed, -10.0, 10.0)  # 保持寬廣的數值空間
-
-    normed_arrays.append(normed.values.astype(np.float32))
-
-feat_array = np.stack(normed_arrays, axis=2)
-print(f"個股特徵處理完畢，形狀: {feat_array.shape}")
-
-# NumPy 陣列轉換
-mask_array = mask[stocks].values.astype(np.uint8)
-label_array = labels[stocks].values.astype(np.int8)
-
-assert not np.isnan(feat_array).any(), "❌ 特徵仍含 NaN"
-assert not np.isinf(feat_array).any(), "❌ 特徵仍含 Inf"
-print("✅ 特徵數值正常")
-
-# ------ 儲存最終打包資料 ------
-print(f"\n儲存最終壓縮特徵矩陣至 {output_dir}...")
-np.savez_compressed(
-    os.path.join(output_dir, 'features.npz'),
-    features=feat_array,       # (T, N, F=15)
-    mask=mask_array,           # (T, N)
-    labels=label_array,        # (T, N)
-    stocks=np.array(stocks),   
-    dates=df_feat.index.values 
-)
-print(f"🎉 V4 完全體特徵工程封裝完畢！最終矩陣維度: {feat_array.shape}")
+if __name__ == '__main__':
+    main()
